@@ -185,6 +185,34 @@ async function saveBlocks(key, blocks) {
   return storageSet(STORAGE_KEY, JSON.stringify({ v: 1, ...env }));
 }
 
+// Verifies the current password, then re-encrypts the snippets under a key
+// derived from the new password. Returns { key } on success or { error }.
+async function changePassword(currentPw, nextPw, blocks) {
+  const auth = parseAuth(await storageGet(AUTH_KEY));
+  if (!auth || auth.v !== 2) return { error: "Unlock again before changing the password" };
+  const oldKey = await deriveKey(currentPw, fromB64(auth.salt), auth.iter);
+  try {
+    if ((await decryptString(oldKey, auth.check)) !== CHECK_PLAINTEXT) throw new Error();
+  } catch { return { error: "Current password is wrong" }; }
+
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const key = await deriveKey(nextPw, salt, KDF_ITERATIONS);
+  const check = await encryptString(key, CHECK_PLAINTEXT);
+  const env = await encryptString(key, JSON.stringify(blocks));
+
+  // Write both entries back to back so data and auth never disagree; if the
+  // second write fails, restore the old data.
+  const prevData = localStorage.getItem(STORAGE_KEY);
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ v: 1, ...env }));
+    localStorage.setItem(AUTH_KEY, JSON.stringify({ v: 2, salt: toB64(salt), iter: KDF_ITERATIONS, check }));
+  } catch {
+    try { if (prevData !== null) localStorage.setItem(STORAGE_KEY, prevData); } catch { /* nothing more to do */ }
+    return { error: "Couldn't save the new password. Nothing was changed." };
+  }
+  return { key };
+}
+
 /* ══════════════════════════════════════════
    SYNTAX HIGHLIGHTING (One Dark palette)
    ══════════════════════════════════════════ */
@@ -300,6 +328,14 @@ function UploadIcon() {
 
 function LockIcon() {
   return (<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /></svg>);
+}
+
+function SmallLockIcon() {
+  return (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /></svg>);
+}
+
+function KeyIcon() {
+  return (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="7.5" cy="15.5" r="4.5" /><path d="M10.7 12.3L21 2" /><path d="M16 7l3 3" /><path d="M19 4l2 2" /></svg>);
 }
 
 function EyeIcon() {
@@ -702,6 +738,72 @@ function ImportDialog({ pending, currentCount, onMerge, onReplace, onClose }) {
 }
 
 /* ══════════════════════════════════════════
+   CHANGE PASSWORD MODAL
+   ══════════════════════════════════════════ */
+function PasswordModal({ isOpen, onClose, onChange }) {
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [error, setError] = useState("");
+  const [done, setDone] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (isOpen) {
+      setCurrent(""); setNext(""); setConfirm(""); setError(""); setDone(false); setBusy(false);
+      setTimeout(() => ref.current?.focus(), 100);
+    }
+  }, [isOpen]);
+
+  if (!isOpen) return null;
+
+  const submit = async () => {
+    if (busy) return;
+    if (next.length < 4) { setError("New password needs at least 4 characters"); return; }
+    if (next !== confirm) { setError("New passwords don't match"); return; }
+    setBusy(true);
+    const err = await onChange(current, next);
+    setBusy(false);
+    if (err) { setError(err); setCurrent(""); ref.current?.focus(); return; }
+    setDone(true);
+  };
+
+  const handleKey = (e) => { if (e.key === "Enter") submit(); };
+  const inp = { width: "100%", padding: "10px 14px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.08)", background: "rgba(255,255,255,0.03)", color: "#e2e8f0", fontSize: 13, fontFamily: "'JetBrains Mono', monospace", outline: "none", boxSizing: "border-box", marginBottom: 10 };
+  const field = (value, set, placeholder, r) => (
+    <input ref={r} type="password" value={value} onChange={e => { set(e.target.value); setError(""); }} onKeyDown={handleKey} placeholder={placeholder} style={inp} />
+  );
+
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 100, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.7)", backdropFilter: "blur(4px)", animation: "fadeIn 0.15s ease", padding: 16 }} onClick={e => e.target === e.currentTarget && onClose()}>
+      <div style={{ background: "#0f1219", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 14, padding: 24, width: "100%", maxWidth: 380 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+          <h2 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: "#e2e8f0", fontFamily: "'JetBrains Mono', monospace" }}>Change Password</h2>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 20, padding: "2px 6px" }}>x</button>
+        </div>
+        {done ? (
+          <>
+            <p style={{ margin: "0 0 16px", fontSize: 13, color: "#34d399", fontFamily: "'JetBrains Mono', monospace" }}>Password updated.</p>
+            <button onClick={onClose} style={{ width: "100%", padding: "11px 0", borderRadius: 8, border: "none", background: "linear-gradient(135deg, #34d399, #2dd4bf)", color: "#0a1120", cursor: "pointer", fontSize: 13, fontWeight: 700, fontFamily: "'Outfit', sans-serif" }}>Done</button>
+          </>
+        ) : (
+          <>
+            {field(current, setCurrent, "Current password", ref)}
+            {field(next, setNext, "New password")}
+            {field(confirm, setConfirm, "Confirm new password")}
+            {error && <p style={{ margin: "0 0 10px", fontSize: 12, color: "#f87171", fontFamily: "'JetBrains Mono', monospace" }}>{error}</p>}
+            <button onClick={submit} disabled={!current || !next || busy} style={{ width: "100%", padding: "11px 0", borderRadius: 8, border: "none", marginTop: 4, background: current && next ? "linear-gradient(135deg, #34d399, #2dd4bf)" : "#1e293b", color: current && next ? "#0a1120" : "#475569", cursor: current && next ? "pointer" : "default", fontSize: 13, fontWeight: 700, fontFamily: "'Outfit', sans-serif" }}>
+              {busy ? "Saving..." : "Change Password"}
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════
    MAIN APP
    ══════════════════════════════════════════ */
 function SnippetVault() {
@@ -714,10 +816,12 @@ function SnippetVault() {
   const [search, setSearch] = useState("");
   const [modalOpen, setModalOpen] = useState(false);
   const [editBlock, setEditBlock] = useState(null);
+  const [pwModalOpen, setPwModalOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [pendingImport, setPendingImport] = useState(null);
   const [notice, setNotice] = useState("");
   const fileRef = useRef(null);
+  const searchRef = useRef(null);
 
   useEffect(() => {
     if (!authed) return;
@@ -744,6 +848,16 @@ function SnippetVault() {
   const persist = useCallback((d) => {
     writeQueue.current = writeQueue.current.then(() => saveBlocks(cryptoKey, d)).catch(() => {});
   }, [cryptoKey]);
+
+  // Re-key after pending writes finish; queued so no save uses the old key afterwards.
+  const handleChangePassword = (current, next) => {
+    const run = writeQueue.current.then(() => changePassword(current, next, blocks));
+    writeQueue.current = run.catch(() => {});
+    return run.then(res => {
+      if (res.key) setCryptoKey(res.key);
+      return res.error || null;
+    }, () => "Couldn't change the password. Nothing was changed.");
+  };
 
   const handleSave = (block) => {
     setBlocks(p => {
@@ -805,6 +919,23 @@ function SnippetVault() {
     const t = setTimeout(() => setNotice(""), 4000);
     return () => clearTimeout(t);
   }, [notice]);
+  // Drop decrypted/loaded data from memory and return to the lock screen.
+  const lock = () => {
+    setBlocks([]); setSearch(""); setActiveTags([]); setFilter("all");
+    setModalOpen(false); setEditBlock(null); setPwModalOpen(false); setPendingImport(null); setNotice("");
+    setLoading(true); setLoadError(false); setCryptoKey(null);
+  };
+
+  // "/" focuses search, Escape clears it.
+  useEffect(() => {
+    if (!authed) return;
+    const onKey = (e) => {
+      const typing = /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName);
+      if (e.key === "/" && !typing && !modalOpen && !pwModalOpen && !pendingImport) { e.preventDefault(); searchRef.current?.focus(); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [authed, modalOpen, pwModalOpen, pendingImport]);
 
   const handleEdit = (b) => { setEditBlock(b); setModalOpen(true); };
   const toggleTag = (tag) => { setActiveTags(p => p.includes(tag) ? p.filter(t => t !== tag) : [...p, tag]); };
@@ -818,9 +949,9 @@ function SnippetVault() {
   const filtered = blocks.filter(b => {
     if (filter !== "all" && b.category !== filter) return false;
     if (activeTags.length > 0 && !activeTags.every(t => (b.tags || []).includes(t))) return false;
-    if (search) {
-      const q = search.toLowerCase();
-      return b.title.toLowerCase().includes(q) || b.content.toLowerCase().includes(q) || (b.tags || []).some(t => t.includes(q));
+    const q = search.trim().toLowerCase();
+    if (q) {
+      return (b.title || "").toLowerCase().includes(q) || (b.content || "").toLowerCase().includes(q) || (b.tags || []).some(t => t.toLowerCase().includes(q));
     }
     return true;
   });
@@ -870,20 +1001,26 @@ function SnippetVault() {
 
         {/* Header */}
         <div style={{ marginBottom: 28 }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
             <div>
               <h1 style={{ margin: 0, fontSize: 22, fontWeight: 700, letterSpacing: "-0.03em", background: "linear-gradient(135deg, #34d399, #2dd4bf)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent", fontFamily: "'Outfit', sans-serif" }}>snippet vault</h1>
               <p style={{ margin: "4px 0 0", fontSize: 12, color: "#475569", fontFamily: "'JetBrains Mono', monospace" }}>{blocks.length} block{blocks.length !== 1 ? "s" : ""} saved</p>
             </div>
-            <div style={{ display: "flex", gap: 8 }}>
-              <button onClick={handleExport} title="Export backup" aria-label="Export backup" style={{ width: 40, height: 40, borderRadius: 10, border: "1px solid rgba(255,255,255,0.08)", background: "rgba(255,255,255,0.02)", color: "#94a3b8", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+              <button onClick={handleExport} title="Export backup" aria-label="Export backup" style={{ width: 40, height: 40, borderRadius: 10, border: "1px solid rgba(255,255,255,0.08)", background: "transparent", color: "#64748b", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
                 <DownloadIcon />
               </button>
-              <button onClick={() => fileRef.current?.click()} title="Import backup" aria-label="Import backup" style={{ width: 40, height: 40, borderRadius: 10, border: "1px solid rgba(255,255,255,0.08)", background: "rgba(255,255,255,0.02)", color: "#94a3b8", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <button onClick={() => fileRef.current?.click()} title="Import backup" aria-label="Import backup" style={{ width: 40, height: 40, borderRadius: 10, border: "1px solid rgba(255,255,255,0.08)", background: "transparent", color: "#64748b", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
                 <UploadIcon />
               </button>
               <input ref={fileRef} type="file" accept="application/json,.json" onChange={handleImportFile} style={{ display: "none" }} />
-              <button onClick={() => { setEditBlock(null); setModalOpen(true); }} style={{ width: 40, height: 40, borderRadius: 10, border: "1px solid rgba(52,211,153,0.25)", background: "rgba(52,211,153,0.06)", color: "#34d399", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <button onClick={() => setPwModalOpen(true)} title="Change password" aria-label="Change password" style={{ width: 40, height: 40, borderRadius: 10, border: "1px solid rgba(255,255,255,0.08)", background: "transparent", color: "#64748b", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <KeyIcon />
+              </button>
+              <button onClick={lock} title="Lock" aria-label="Lock" style={{ width: 40, height: 40, borderRadius: 10, border: "1px solid rgba(255,255,255,0.08)", background: "transparent", color: "#64748b", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <SmallLockIcon />
+              </button>
+              <button onClick={() => { setEditBlock(null); setModalOpen(true); }} title="New block" aria-label="New block" style={{ width: 40, height: 40, borderRadius: 10, border: "1px solid rgba(52,211,153,0.25)", background: "rgba(52,211,153,0.06)", color: "#34d399", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
                 <PlusIcon />
               </button>
             </div>
@@ -895,7 +1032,12 @@ function SnippetVault() {
 
         {/* Search + Category */}
         <div style={{ display: "flex", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
-          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search blocks..." style={{ flex: 1, minWidth: 160, padding: "9px 14px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.06)", background: "rgba(255,255,255,0.02)", color: "#e2e8f0", fontSize: 13, fontFamily: "'JetBrains Mono', monospace", outline: "none" }} />
+          <div style={{ position: "relative", flex: 1, minWidth: 160, display: "flex" }}>
+          <input ref={searchRef} value={search} onChange={e => setSearch(e.target.value)} onKeyDown={e => { if (e.key === "Escape") { setSearch(""); e.target.blur(); } }} placeholder="Search titles & content  ( / )" style={{ flex: 1, minWidth: 0, padding: "9px 32px 9px 14px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.06)", background: "rgba(255,255,255,0.02)", color: "#e2e8f0", fontSize: 13, fontFamily: "'JetBrains Mono', monospace", outline: "none" }} />
+          {search && (
+            <button onClick={() => { setSearch(""); searchRef.current?.focus(); }} aria-label="Clear search" style={{ position: "absolute", right: 6, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 14, padding: "2px 6px" }}>x</button>
+          )}
+          </div>
           <div style={{ display: "flex", gap: 4 }}>
             {CATEGORIES.map(cat => (
               <button key={cat.id} onClick={() => setFilter(cat.id)} style={{ padding: "8px 14px", borderRadius: 8, whiteSpace: "nowrap", border: filter === cat.id ? "1px solid rgba(52,211,153,0.3)" : "1px solid rgba(255,255,255,0.06)", background: filter === cat.id ? "rgba(52,211,153,0.08)" : "transparent", color: filter === cat.id ? "#34d399" : "#64748b", cursor: "pointer", fontSize: 12, fontFamily: "'JetBrains Mono', monospace", fontWeight: filter === cat.id ? 600 : 400 }}>
@@ -907,6 +1049,10 @@ function SnippetVault() {
 
         {/* Tag Filter */}
         <TagFilterBar allTags={allTags} activeTags={activeTags} onToggle={toggleTag} onClear={() => setActiveTags([])} />
+
+        {search.trim() && (
+          <p style={{ margin: "0 0 10px", fontSize: 11, color: "#475569", fontFamily: "'JetBrains Mono', monospace" }}>{filtered.length} match{filtered.length !== 1 ? "es" : ""}</p>
+        )}
 
         {/* Cards */}
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -935,6 +1081,7 @@ function SnippetVault() {
 
       <ImportDialog pending={pendingImport} currentCount={blocks.length} onMerge={() => applyImport("merge")} onReplace={() => applyImport("replace")} onClose={() => setPendingImport(null)} />
       <Modal isOpen={modalOpen} onClose={() => { setModalOpen(false); setEditBlock(null); }} onSave={handleSave} editBlock={editBlock} />
+      <PasswordModal isOpen={pwModalOpen} onClose={() => setPwModalOpen(false)} onChange={handleChangePassword} />
     </div>
   );
 }
