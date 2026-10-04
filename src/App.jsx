@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo, Component } from "react";
+import { buildBackup, backupFileName, parseBackup, mergeSnippets } from "./backup.js";
 
 /* ══════════════════════════════════════════
    ERROR BOUNDARY
@@ -315,6 +316,14 @@ function EditIcon() {
 
 function PlusIcon() {
   return (<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>);
+}
+
+function DownloadIcon() {
+  return (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>);
+}
+
+function UploadIcon() {
+  return (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" /></svg>);
 }
 
 function LockIcon() {
@@ -676,6 +685,59 @@ function Modal({ isOpen, onClose, onSave, editBlock }) {
 }
 
 /* ══════════════════════════════════════════
+   IMPORT DIALOG
+   ══════════════════════════════════════════ */
+function ImportDialog({ pending, currentCount, onMerge, onReplace, onClose }) {
+  const [confirmReplace, setConfirmReplace] = useState(false);
+  useEffect(() => { setConfirmReplace(false); }, [pending]);
+  if (!pending) return null;
+
+  const mono = { fontFamily: "'JetBrains Mono', monospace" };
+  const btn = { padding: "10px 18px", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer", ...mono };
+  const n = pending.snippets?.length || 0;
+
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 100, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.7)", backdropFilter: "blur(4px)", animation: "fadeIn 0.15s ease", padding: 16 }} onClick={e => e.target === e.currentTarget && onClose()}>
+      <div style={{ background: "#0f1219", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 14, padding: 24, width: "100%", maxWidth: 440 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <h2 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: "#e2e8f0", ...mono }}>Import backup</h2>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 20, padding: "2px 6px" }}>x</button>
+        </div>
+        <p style={{ margin: "0 0 6px", fontSize: 12, color: "#64748b", wordBreak: "break-all", ...mono }}>{pending.fileName}</p>
+
+        {pending.error ? (
+          <>
+            <p style={{ margin: "12px 0 20px", fontSize: 13, color: "#f87171", ...mono }}>{pending.error}</p>
+            <div style={{ display: "flex", justifyContent: "flex-end" }}>
+              <button onClick={onClose} style={{ ...btn, border: "1px solid rgba(255,255,255,0.08)", background: "none", color: "#94a3b8" }}>Close</button>
+            </div>
+          </>
+        ) : (
+          <>
+            <p style={{ margin: "12px 0 20px", fontSize: 13, color: "#cbd5e1", lineHeight: 1.6 }}>
+              {confirmReplace
+                ? `Replace all ${currentCount} current block${currentCount !== 1 ? "s" : ""} with the ${n} in this file? This cannot be undone.`
+                : `This file has ${n} block${n !== 1 ? "s" : ""}. Merge keeps your current blocks and adds or updates from the file. Replace discards your current blocks.`}
+            </p>
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
+              <button onClick={confirmReplace ? () => setConfirmReplace(false) : onClose} style={{ ...btn, border: "1px solid rgba(255,255,255,0.08)", background: "none", color: "#94a3b8" }}>Cancel</button>
+              {confirmReplace ? (
+                <button onClick={onReplace} style={{ ...btn, border: "none", background: "#f87171", color: "#0a1120", fontWeight: 700 }}>Replace all</button>
+              ) : (
+                <>
+                  <button onClick={() => setConfirmReplace(true)} style={{ ...btn, border: "1px solid rgba(248,113,113,0.4)", background: "rgba(248,113,113,0.08)", color: "#f87171" }}>Replace</button>
+                  <button onClick={onMerge} style={{ ...btn, border: "none", background: "linear-gradient(135deg,#34d399,#2dd4bf)", color: "#0a1120", fontWeight: 700 }}>Merge</button>
+                </>
+              )}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════
    CHANGE PASSWORD MODAL
    ══════════════════════════════════════════ */
 function PasswordModal({ isOpen, onClose, onChange }) {
@@ -756,6 +818,9 @@ function SnippetVault() {
   const [editBlock, setEditBlock] = useState(null);
   const [pwModalOpen, setPwModalOpen] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [pendingImport, setPendingImport] = useState(null);
+  const [notice, setNotice] = useState("");
+  const fileRef = useRef(null);
   const searchRef = useRef(null);
 
   useEffect(() => {
@@ -808,10 +873,56 @@ function SnippetVault() {
     setBlocks(p => { const next = p.filter(b => b.id !== id); persist(next); return next; });
   };
 
+  const handleExport = () => {
+    const blob = new Blob([JSON.stringify(buildBackup(blocks), null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = backupFileName();
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  };
+
+  const handleImportFile = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    try {
+      const snippets = parseBackup(await file.text(), { languageIds: LANGUAGES.map(l => l.id), makeId: uid });
+      setPendingImport({ fileName: file.name, snippets });
+    } catch (err) {
+      setPendingImport({ fileName: file.name, error: err.message || "Could not read the file." });
+    }
+  };
+
+  const applyImport = (mode) => {
+    const incoming = pendingImport?.snippets;
+    if (!incoming) return;
+    if (mode === "replace") {
+      setBlocks(incoming);
+      persist(incoming);
+      setNotice(`Replaced vault with ${incoming.length} block${incoming.length !== 1 ? "s" : ""}.`);
+    } else {
+      const r = mergeSnippets(blocks, incoming);
+      setBlocks(r.snippets);
+      persist(r.snippets);
+      setNotice(`Imported: ${r.added} added, ${r.updated} updated, ${r.unchanged} unchanged.`);
+    }
+    setActiveTags([]);
+    setPendingImport(null);
+  };
+
+  useEffect(() => {
+    if (!notice) return;
+    const t = setTimeout(() => setNotice(""), 4000);
+    return () => clearTimeout(t);
+  }, [notice]);
   // Drop decrypted/loaded data from memory and return to the lock screen.
   const lock = () => {
     setBlocks([]); setSearch(""); setActiveTags([]); setFilter("all");
-    setModalOpen(false); setEditBlock(null); setPwModalOpen(false);
+    setModalOpen(false); setEditBlock(null); setPwModalOpen(false); setPendingImport(null); setNotice("");
     setLoading(true); setLoadError(false); setCryptoKey(null);
   };
 
@@ -820,11 +931,11 @@ function SnippetVault() {
     if (!authed) return;
     const onKey = (e) => {
       const typing = /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName);
-      if (e.key === "/" && !typing && !modalOpen && !pwModalOpen) { e.preventDefault(); searchRef.current?.focus(); }
+      if (e.key === "/" && !typing && !modalOpen && !pwModalOpen && !pendingImport) { e.preventDefault(); searchRef.current?.focus(); }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [authed, modalOpen, pwModalOpen]);
+  }, [authed, modalOpen, pwModalOpen, pendingImport]);
 
   const handleEdit = (b) => { setEditBlock(b); setModalOpen(true); };
   const toggleTag = (tag) => { setActiveTags(p => p.includes(tag) ? p.filter(t => t !== tag) : [...p, tag]); };
@@ -890,23 +1001,33 @@ function SnippetVault() {
 
         {/* Header */}
         <div style={{ marginBottom: 28 }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
             <div>
               <h1 style={{ margin: 0, fontSize: 22, fontWeight: 700, letterSpacing: "-0.03em", background: "linear-gradient(135deg, #34d399, #2dd4bf)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent", fontFamily: "'Outfit', sans-serif" }}>snippet vault</h1>
               <p style={{ margin: "4px 0 0", fontSize: 12, color: "#475569", fontFamily: "'JetBrains Mono', monospace" }}>{blocks.length} block{blocks.length !== 1 ? "s" : ""} saved</p>
             </div>
-            <div style={{ display: "flex", gap: 8 }}>
-            <button onClick={() => setPwModalOpen(true)} title="Change password" aria-label="Change password" style={{ width: 40, height: 40, borderRadius: 10, border: "1px solid rgba(255,255,255,0.08)", background: "transparent", color: "#64748b", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
-              <KeyIcon />
-            </button>
-            <button onClick={lock} title="Lock" aria-label="Lock" style={{ width: 40, height: 40, borderRadius: 10, border: "1px solid rgba(255,255,255,0.08)", background: "transparent", color: "#64748b", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
-              <SmallLockIcon />
-            </button>
-            <button onClick={() => { setEditBlock(null); setModalOpen(true); }} title="New block" aria-label="New block" style={{ width: 40, height: 40, borderRadius: 10, border: "1px solid rgba(52,211,153,0.25)", background: "rgba(52,211,153,0.06)", color: "#34d399", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
-              <PlusIcon />
-            </button>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+              <button onClick={handleExport} title="Export backup" aria-label="Export backup" style={{ width: 40, height: 40, borderRadius: 10, border: "1px solid rgba(255,255,255,0.08)", background: "transparent", color: "#64748b", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <DownloadIcon />
+              </button>
+              <button onClick={() => fileRef.current?.click()} title="Import backup" aria-label="Import backup" style={{ width: 40, height: 40, borderRadius: 10, border: "1px solid rgba(255,255,255,0.08)", background: "transparent", color: "#64748b", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <UploadIcon />
+              </button>
+              <input ref={fileRef} type="file" accept="application/json,.json" onChange={handleImportFile} style={{ display: "none" }} />
+              <button onClick={() => setPwModalOpen(true)} title="Change password" aria-label="Change password" style={{ width: 40, height: 40, borderRadius: 10, border: "1px solid rgba(255,255,255,0.08)", background: "transparent", color: "#64748b", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <KeyIcon />
+              </button>
+              <button onClick={lock} title="Lock" aria-label="Lock" style={{ width: 40, height: 40, borderRadius: 10, border: "1px solid rgba(255,255,255,0.08)", background: "transparent", color: "#64748b", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <SmallLockIcon />
+              </button>
+              <button onClick={() => { setEditBlock(null); setModalOpen(true); }} title="New block" aria-label="New block" style={{ width: 40, height: 40, borderRadius: 10, border: "1px solid rgba(52,211,153,0.25)", background: "rgba(52,211,153,0.06)", color: "#34d399", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <PlusIcon />
+              </button>
             </div>
           </div>
+          {notice && (
+            <p role="status" style={{ margin: "10px 0 0", fontSize: 12, color: "#34d399", fontFamily: "'JetBrains Mono', monospace", animation: "fadeIn 0.15s ease" }}>{notice}</p>
+          )}
         </div>
 
         {/* Search + Category */}
@@ -958,6 +1079,7 @@ function SnippetVault() {
         </div>
       </div>
 
+      <ImportDialog pending={pendingImport} currentCount={blocks.length} onMerge={() => applyImport("merge")} onReplace={() => applyImport("replace")} onClose={() => setPendingImport(null)} />
       <Modal isOpen={modalOpen} onClose={() => { setModalOpen(false); setEditBlock(null); }} onSave={handleSave} editBlock={editBlock} />
       <PasswordModal isOpen={pwModalOpen} onClose={() => setPwModalOpen(false)} onChange={handleChangePassword} />
     </div>
