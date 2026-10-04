@@ -9,6 +9,7 @@ Password-protected code snippet and prompt manager with syntax highlighting and 
 - Tag system with color-coded chips and multi-tag filtering
 - Tap any card to copy to clipboard
 - Pre-loaded with prompt templates
+- Export your vault to a JSON backup and import it back (merge or replace)
 
 ## Local Development
 
