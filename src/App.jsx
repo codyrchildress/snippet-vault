@@ -97,19 +97,119 @@ const AUTH_KEY = "snippet-vault-auth";
 /* ══════════════════════════════════════════
    CRYPTO
    ══════════════════════════════════════════ */
+// Legacy (v1) auth stored only a SHA-256 hash of the password. Kept so
+// existing vaults can be unlocked once and migrated to encrypted storage.
 async function sha256(str) {
   const buf = new TextEncoder().encode(str);
   const hash = await crypto.subtle.digest("SHA-256", buf);
   return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
-// Verifies the current password and stores the new one. Returns an error message, or null on success.
-// NOTE: once snippets are encrypted with a password-derived key, this must also re-encrypt them.
-async function changePassword(currentPw, nextPw) {
-  const stored = await storageGet(AUTH_KEY);
-  if (stored !== await sha256(currentPw)) return "Current password is wrong";
-  await storageSet(AUTH_KEY, await sha256(nextPw));
-  return null;
+// v2: snippets are encrypted with AES-GCM using a key derived from the
+// password via PBKDF2. AUTH_KEY holds { v, salt, iter, check } where
+// `check` is a known string encrypted with the key, used to verify the password.
+const KDF_ITERATIONS = 600000;
+const CHECK_PLAINTEXT = "snippet-vault";
+
+function toB64(buf) {
+  let s = "";
+  new Uint8Array(buf).forEach(b => { s += String.fromCharCode(b); });
+  return btoa(s);
+}
+function fromB64(str) {
+  return Uint8Array.from(atob(str), c => c.charCodeAt(0));
+}
+
+async function deriveKey(password, salt, iterations) {
+  const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations, hash: "SHA-256" },
+    base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]
+  );
+}
+
+async function encryptString(key, plaintext) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(plaintext));
+  return { iv: toB64(iv), ct: toB64(ct) };
+}
+
+async function decryptString(key, { iv, ct }) {
+  const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: fromB64(iv) }, key, fromB64(ct));
+  return new TextDecoder().decode(pt);
+}
+
+function parseAuth(raw) {
+  if (!raw) return null;
+  try {
+    const a = JSON.parse(raw);
+    if (a && a.v === 2 && a.salt && a.check) return a;
+  } catch { /* legacy hex hash */ }
+  return { v: 1, hash: raw };
+}
+
+async function createAuth(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const key = await deriveKey(password, salt, KDF_ITERATIONS);
+  const check = await encryptString(key, CHECK_PLAINTEXT);
+  await storageSet(AUTH_KEY, JSON.stringify({ v: 2, salt: toB64(salt), iter: KDF_ITERATIONS, check }));
+  return key;
+}
+
+// Returns the derived key, or null if the password is wrong.
+async function unlockAuth(password, auth) {
+  if (auth.v === 1) {
+    // Correct legacy password: upgrade auth now; plaintext snippets are
+    // re-encrypted on load (see loadBlocks).
+    return (await sha256(password)) === auth.hash ? createAuth(password) : null;
+  }
+  const key = await deriveKey(password, fromB64(auth.salt), auth.iter);
+  try {
+    return (await decryptString(key, auth.check)) === CHECK_PLAINTEXT ? key : null;
+  } catch { return null; }
+}
+
+// Reads snippets. Plaintext JSON left over from before encryption is
+// returned with `migrate: true` so the caller re-saves it encrypted.
+async function loadBlocks(key) {
+  const raw = await storageGet(STORAGE_KEY);
+  if (!raw) return { blocks: null, migrate: false };
+  const data = JSON.parse(raw);
+  if (Array.isArray(data)) return { blocks: data, migrate: true };
+  return { blocks: JSON.parse(await decryptString(key, data)), migrate: false };
+}
+
+async function saveBlocks(key, blocks) {
+  const env = await encryptString(key, JSON.stringify(blocks));
+  return storageSet(STORAGE_KEY, JSON.stringify({ v: 1, ...env }));
+}
+
+// Verifies the current password, then re-encrypts the snippets under a key
+// derived from the new password. Returns { key } on success or { error }.
+async function changePassword(currentPw, nextPw, blocks) {
+  const auth = parseAuth(await storageGet(AUTH_KEY));
+  if (!auth || auth.v !== 2) return { error: "Unlock again before changing the password" };
+  const oldKey = await deriveKey(currentPw, fromB64(auth.salt), auth.iter);
+  try {
+    if ((await decryptString(oldKey, auth.check)) !== CHECK_PLAINTEXT) throw new Error();
+  } catch { return { error: "Current password is wrong" }; }
+
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const key = await deriveKey(nextPw, salt, KDF_ITERATIONS);
+  const check = await encryptString(key, CHECK_PLAINTEXT);
+  const env = await encryptString(key, JSON.stringify(blocks));
+
+  // Write both entries back to back so data and auth never disagree; if the
+  // second write fails, restore the old data.
+  const prevData = localStorage.getItem(STORAGE_KEY);
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ v: 1, ...env }));
+    localStorage.setItem(AUTH_KEY, JSON.stringify({ v: 2, salt: toB64(salt), iter: KDF_ITERATIONS, check }));
+  } catch {
+    try { if (prevData !== null) localStorage.setItem(STORAGE_KEY, prevData); } catch { /* nothing more to do */ }
+    return { error: "Couldn't save the new password. Nothing was changed." };
+  }
+  return { key };
 }
 
 /* ══════════════════════════════════════════
@@ -315,13 +415,16 @@ function LockScreen({ onUnlock }) {
   const [show, setShow] = useState(false);
   const [error, setError] = useState("");
   const [shaking, setShaking] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const authRef = useRef(null);
   const inputRef = useRef(null);
 
   useEffect(() => {
     let cancelled = false;
     storageGet(AUTH_KEY).then(val => {
       if (cancelled) return;
-      setMode(val ? "login" : "setup");
+      authRef.current = parseAuth(val);
+      setMode(authRef.current ? "login" : "setup");
       setTimeout(() => inputRef.current?.focus(), 150);
     });
     return () => { cancelled = true; };
@@ -332,22 +435,24 @@ function LockScreen({ onUnlock }) {
   const handleSetup = async () => {
     if (pw.length < 4) { setError("At least 4 characters"); shake(); return; }
     if (pw !== confirm) { setError("Passwords don't match"); shake(); return; }
-    const hash = await sha256(pw);
-    await storageSet(AUTH_KEY, hash);
-    onUnlock();
+    setBusy(true);
+    const key = await createAuth(pw);
+    onUnlock(key);
   };
 
   const handleLogin = async () => {
-    const hash = await sha256(pw);
-    const stored = await storageGet(AUTH_KEY);
-    if (stored === hash) { onUnlock(); return; }
+    if (busy) return;
+    setBusy(true);
+    const key = await unlockAuth(pw, authRef.current);
+    if (key) { onUnlock(key); return; }
+    setBusy(false);
     setError("Wrong password");
     shake();
     setPw("");
     setTimeout(() => inputRef.current?.focus(), 50);
   };
 
-  const handleKey = (e) => { if (e.key === "Enter") { mode === "setup" ? handleSetup() : handleLogin(); } };
+  const handleKey = (e) => { if (e.key === "Enter" && !busy) { mode === "setup" ? handleSetup() : handleLogin(); } };
 
   if (mode === "loading") {
     return (
@@ -388,8 +493,8 @@ function LockScreen({ onUnlock }) {
 
         {error && <p style={{ margin: "0 0 12px", fontSize: 12, color: "#f87171", fontFamily: "'JetBrains Mono', monospace" }}>{error}</p>}
 
-        <button onClick={mode === "setup" ? handleSetup : handleLogin} disabled={!pw} style={{ width: "100%", padding: "13px 0", borderRadius: 10, border: "none", marginTop: 8, background: pw ? "linear-gradient(135deg, #34d399, #2dd4bf)" : "#1e293b", color: pw ? "#0a1120" : "#475569", cursor: pw ? "pointer" : "default", fontSize: 14, fontWeight: 700, fontFamily: "'Outfit', sans-serif", letterSpacing: "0.02em" }}>
-          {mode === "setup" ? "Set Password & Enter" : "Unlock"}
+        <button onClick={mode === "setup" ? handleSetup : handleLogin} disabled={!pw || busy} style={{ width: "100%", padding: "13px 0", borderRadius: 10, border: "none", marginTop: 8, background: pw ? "linear-gradient(135deg, #34d399, #2dd4bf)" : "#1e293b", color: pw ? "#0a1120" : "#475569", cursor: pw ? "pointer" : "default", fontSize: 14, fontWeight: 700, fontFamily: "'Outfit', sans-serif", letterSpacing: "0.02em" }}>
+          {busy ? "Unlocking..." : mode === "setup" ? "Set Password & Enter" : "Unlock"}
         </button>
       </div>
     </div>
@@ -573,7 +678,7 @@ function Modal({ isOpen, onClose, onSave, editBlock }) {
 /* ══════════════════════════════════════════
    CHANGE PASSWORD MODAL
    ══════════════════════════════════════════ */
-function PasswordModal({ isOpen, onClose }) {
+function PasswordModal({ isOpen, onClose, onChange }) {
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -596,7 +701,7 @@ function PasswordModal({ isOpen, onClose }) {
     if (next.length < 4) { setError("New password needs at least 4 characters"); return; }
     if (next !== confirm) { setError("New passwords don't match"); return; }
     setBusy(true);
-    const err = await changePassword(current, next);
+    const err = await onChange(current, next);
     setBusy(false);
     if (err) { setError(err); setCurrent(""); ref.current?.focus(); return; }
     setDone(true);
@@ -640,7 +745,9 @@ function PasswordModal({ isOpen, onClose }) {
    MAIN APP
    ══════════════════════════════════════════ */
 function SnippetVault() {
-  const [authed, setAuthed] = useState(false);
+  const [cryptoKey, setCryptoKey] = useState(null);
+  const authed = !!cryptoKey;
+  const [loadError, setLoadError] = useState(false);
   const [blocks, setBlocks] = useState([]);
   const [filter, setFilter] = useState("all");
   const [activeTags, setActiveTags] = useState([]);
@@ -654,20 +761,38 @@ function SnippetVault() {
   useEffect(() => {
     if (!authed) return;
     let cancelled = false;
-    storageGet(STORAGE_KEY).then(val => {
+    loadBlocks(cryptoKey).then(({ blocks: stored, migrate }) => {
       if (cancelled) return;
-      if (val) {
-        try { setBlocks(JSON.parse(val)); } catch { setBlocks(SEED_SNIPPETS); }
+      if (stored) {
+        setBlocks(stored);
+        if (migrate) persist(stored);
       } else {
         setBlocks(SEED_SNIPPETS);
-        storageSet(STORAGE_KEY, JSON.stringify(SEED_SNIPPETS));
+        persist(SEED_SNIPPETS);
       }
       setLoading(false);
+    }).catch(() => {
+      // Never overwrite data we couldn't read.
+      if (!cancelled) setLoadError(true);
     });
     return () => { cancelled = true; };
   }, [authed]);
 
-  const persist = useCallback((d) => { storageSet(STORAGE_KEY, JSON.stringify(d)); }, []);
+  // Encryption is async, so chain writes to keep them in order.
+  const writeQueue = useRef(Promise.resolve());
+  const persist = useCallback((d) => {
+    writeQueue.current = writeQueue.current.then(() => saveBlocks(cryptoKey, d)).catch(() => {});
+  }, [cryptoKey]);
+
+  // Re-key after pending writes finish; queued so no save uses the old key afterwards.
+  const handleChangePassword = (current, next) => {
+    const run = writeQueue.current.then(() => changePassword(current, next, blocks));
+    writeQueue.current = run.catch(() => {});
+    return run.then(res => {
+      if (res.key) setCryptoKey(res.key);
+      return res.error || null;
+    }, () => "Couldn't change the password. Nothing was changed.");
+  };
 
   const handleSave = (block) => {
     setBlocks(p => {
@@ -687,7 +812,7 @@ function SnippetVault() {
   const lock = () => {
     setBlocks([]); setSearch(""); setActiveTags([]); setFilter("all");
     setModalOpen(false); setEditBlock(null); setPwModalOpen(false);
-    setLoading(true); setAuthed(false);
+    setLoading(true); setLoadError(false); setCryptoKey(null);
   };
 
   // "/" focuses search, Escape clears it.
@@ -735,7 +860,16 @@ function SnippetVault() {
     return (
       <div style={{ fontFamily: "'Outfit', -apple-system, sans-serif" }}>
         <style>{globalCSS}</style>
-        <LockScreen onUnlock={() => setAuthed(true)} />
+        <LockScreen onUnlock={setCryptoKey} />
+      </div>
+    );
+  }
+
+  if (loadError) {
+    return (
+      <div style={{ minHeight: "100vh", background: "#080b12", display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
+        <style>{globalCSS}</style>
+        <span style={{ color: "#f87171", fontFamily: "'JetBrains Mono', monospace", fontSize: 14, textAlign: "center" }}>Couldn't decrypt saved snippets. Nothing was changed.</span>
       </div>
     );
   }
@@ -825,7 +959,7 @@ function SnippetVault() {
       </div>
 
       <Modal isOpen={modalOpen} onClose={() => { setModalOpen(false); setEditBlock(null); }} onSave={handleSave} editBlock={editBlock} />
-      <PasswordModal isOpen={pwModalOpen} onClose={() => setPwModalOpen(false)} />
+      <PasswordModal isOpen={pwModalOpen} onClose={() => setPwModalOpen(false)} onChange={handleChangePassword} />
     </div>
   );
 }
